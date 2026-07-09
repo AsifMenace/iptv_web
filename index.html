@@ -570,16 +570,35 @@
   }
 
   // ---------- playback ----------
+  // Translate the numeric codes Xtream servers commonly return into plain
+  // English. Several are non-standard IPTV panel codes.
+  function explainCode(code) {
+    switch (Number(code)) {
+      case 402: return "this channel isn't included in your subscription package";
+      case 403: return "forbidden — auth or geo-block";
+      case 404: return "stream not found on the server";
+      case 456:
+      case 458:
+      case 459: return "connection limit reached or stream blocked — close other players and wait a few seconds";
+      case 512:
+      case 520:
+      case 523: return "stream is offline on the server right now";
+      default: return "HTTP " + code;
+    }
+  }
+
   function diagnose(src) {
     // Fetch the proxied playlist directly so we can report the real reason
     // instead of an endless silent retry.
     fetch(src).then(function (r) {
       return r.text().then(function (t) {
-        var head = t.slice(0, 60).replace(/\s+/g, " ");
+        var head = t.slice(0, 80).replace(/\s+/g, " ");
         if (r.ok && t.indexOf("#EXTM3U") !== -1) {
-          $("np-status").textContent = "Stream unplayable in browser (valid HLS, but media rejected)";
+          $("np-status").textContent =
+            "Can't play in browser — the video codec (likely H.265/HEVC or AC-3 audio) isn't supported. Try another channel.";
         } else {
-          $("np-status").textContent = "Stream error: HTTP " + r.status + " — " + head;
+          $("np-status").textContent = "Can't play — " + explainCode(r.status) +
+            (head ? " · " + head : "");
         }
         console.error("[diagnose]", r.status, t.slice(0, 300));
       });
@@ -604,11 +623,13 @@
     function onPlaying() { $("np-status").textContent = "Live"; }
 
     if (window.Hls && window.Hls.isSupported()) {
+      // Keep buffering modest so a connection-limited account isn't hammered.
       hls = new window.Hls({
-        maxBufferLength: 30,
-        manifestLoadingMaxRetry: 2,
-        levelLoadingMaxRetry: 2,
-        fragLoadingMaxRetry: 3
+        maxBufferLength: 12,
+        maxMaxBufferLength: 30,
+        manifestLoadingMaxRetry: 1,
+        levelLoadingMaxRetry: 1,
+        fragLoadingMaxRetry: 2
       });
       hls.loadSource(src);
       hls.attachMedia(video);
@@ -619,16 +640,26 @@
       hls.on(window.Hls.Events.ERROR, function (evt, data) {
         console.warn("[hls]", data && data.type, data && data.details, data);
         if (!data || !data.fatal) return;
-        var detail = (data.details || "") +
-          (data.response && data.response.code ? " (HTTP " + data.response.code + ")" : "");
+        var code = data.response && data.response.code;
+
+        // Permanent, server-side rejections: don't bother retrying.
+        if (code === 402 || code === 403 || code === 404) {
+          hls.destroy(); hls = null;
+          $("np-status").textContent = "Can't play — " + explainCode(code);
+          return;
+        }
+
         switch (data.type) {
           case window.Hls.ErrorTypes.NETWORK_ERROR:
             if (netRetries++ < 2) {
-              $("np-status").textContent = "Network issue [" + detail + "] — retrying (" + netRetries + ")…";
-              hls.startLoad();
+              $("np-status").textContent =
+                (code ? explainCode(code) + " — " : "Network issue — ") +
+                "retrying (" + netRetries + ")…";
+              // Delay the retry: a 458/connection-limit often clears once the
+              // previous connection is released server-side.
+              setTimeout(function () { if (hls) hls.startLoad(); }, 1800);
             } else {
               hls.destroy(); hls = null;
-              $("np-status").textContent = "Failed [" + detail + "] — checking…";
               diagnose(src);
             }
             break;
