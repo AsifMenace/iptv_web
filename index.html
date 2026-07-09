@@ -274,12 +274,12 @@
       <p class="sub">Enter your Xtream Codes login. Credentials are stored only in this browser.</p>
       <div class="field">
         <label>Server URL / Host</label>
-        <input id="f-server" placeholder="e.g. line.example.com or http://host" autocomplete="off" />
+        <input id="f-server" placeholder="e.g. line.example.com or http://host:port" autocomplete="off" />
       </div>
       <div class="row">
         <div class="field">
-          <label>Port</label>
-          <input id="f-port" placeholder="8080" value="80" autocomplete="off" />
+          <label>Port (optional)</label>
+          <input id="f-port" placeholder="80" autocomplete="off" />
         </div>
       </div>
       <div class="field">
@@ -356,10 +356,11 @@
   function buildBase(server, port) {
     var s = String(server || "").trim();
     var scheme = /^https:\/\//i.test(s) ? "https" : "http";
-    var host = s.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
-    // strip any accidental path/port the user pasted into host
-    host = host.split("/")[0].split(":")[0];
-    var p = String(port || "").trim();
+    var hostPort = s.replace(/^https?:\/\//i, "").replace(/\/+$/, "").split("/")[0];
+    var host = hostPort.split(":")[0];
+    // A port pasted into the server field wins; otherwise use the port field.
+    var embedded = hostPort.indexOf(":") !== -1 ? hostPort.split(":")[1] : "";
+    var p = String(port || "").trim() || embedded;
     return scheme + "://" + host + (p ? ":" + p : "");
   }
 
@@ -569,6 +570,24 @@
   }
 
   // ---------- playback ----------
+  function diagnose(src) {
+    // Fetch the proxied playlist directly so we can report the real reason
+    // instead of an endless silent retry.
+    fetch(src).then(function (r) {
+      return r.text().then(function (t) {
+        var head = t.slice(0, 60).replace(/\s+/g, " ");
+        if (r.ok && t.indexOf("#EXTM3U") !== -1) {
+          $("np-status").textContent = "Stream unplayable in browser (valid HLS, but media rejected)";
+        } else {
+          $("np-status").textContent = "Stream error: HTTP " + r.status + " — " + head;
+        }
+        console.error("[diagnose]", r.status, t.slice(0, 300));
+      });
+    }).catch(function (e) {
+      $("np-status").textContent = "Stream unreachable: " + (e.message || e);
+    });
+  }
+
   function playChannel(ch) {
     var video = $("video");
     $("placeholder").style.display = "none";
@@ -578,39 +597,45 @@
     $("np-status").textContent = "Loading…";
 
     var src = proxy(streamUrl(ch.stream_id));
+    var netRetries = 0;
 
     if (hls) { hls.destroy(); hls = null; }
 
     function onPlaying() { $("np-status").textContent = "Live"; }
-    function onError() { $("np-status").textContent = "Playback error"; }
 
     if (window.Hls && window.Hls.isSupported()) {
       hls = new window.Hls({
         maxBufferLength: 30,
-        manifestLoadingMaxRetry: 3,
-        levelLoadingMaxRetry: 3,
-        fragLoadingMaxRetry: 4
+        manifestLoadingMaxRetry: 2,
+        levelLoadingMaxRetry: 2,
+        fragLoadingMaxRetry: 3
       });
       hls.loadSource(src);
       hls.attachMedia(video);
       hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
+        $("np-status").textContent = "Buffering…";
         video.play().catch(function () {});
       });
       hls.on(window.Hls.Events.ERROR, function (evt, data) {
-        if (data && data.fatal) {
-          switch (data.type) {
-            case window.Hls.ErrorTypes.NETWORK_ERROR:
-              $("np-status").textContent = "Network error — retrying…";
+        console.warn("[hls]", data && data.type, data && data.details, data);
+        if (!data || !data.fatal) return;
+        switch (data.type) {
+          case window.Hls.ErrorTypes.NETWORK_ERROR:
+            if (netRetries++ < 2) {
+              $("np-status").textContent = "Network issue — retrying (" + netRetries + ")…";
               hls.startLoad();
-              break;
-            case window.Hls.ErrorTypes.MEDIA_ERROR:
-              hls.recoverMediaError();
-              break;
-            default:
-              onError();
-              hls.destroy();
-              hls = null;
-          }
+            } else {
+              hls.destroy(); hls = null;
+              diagnose(src);
+            }
+            break;
+          case window.Hls.ErrorTypes.MEDIA_ERROR:
+            $("np-status").textContent = "Media error — recovering…";
+            hls.recoverMediaError();
+            break;
+          default:
+            hls.destroy(); hls = null;
+            diagnose(src);
         }
       });
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -624,7 +649,11 @@
     }
 
     video.onplaying = onPlaying;
-    video.onerror = onError;
+    video.onerror = function () {
+      if (video.error) {
+        $("np-status").textContent = "Video error (code " + video.error.code + ")";
+      }
+    };
   }
 
   // ---------- events ----------
@@ -684,8 +713,7 @@
     if (hls) { hls.destroy(); hls = null; }
     showSetup(null);
     $("setup-msg").textContent = "";
-    ["f-server", "f-user", "f-pass"].forEach(function (id) { $(id).value = ""; });
-    $("f-port").value = "80";
+    ["f-server", "f-port", "f-user", "f-pass"].forEach(function (id) { $(id).value = ""; });
   });
 
   // ---------- boot ----------

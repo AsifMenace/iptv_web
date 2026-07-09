@@ -98,16 +98,37 @@ exports.handler = async (event) => {
     });
 
     const contentType = upstream.headers.get("content-type") || "";
-    const looksLikeM3u8 =
-      /\.m3u8(\?|$)/i.test(target) ||
+    const buf = Buffer.from(await upstream.arrayBuffer());
+
+    // If the upstream failed, pass the real status + body straight through
+    // (don't disguise an error page as a valid playlist — that just makes
+    // hls.js retry forever with no clue why).
+    if (!upstream.ok) {
+      return {
+        statusCode: upstream.status,
+        headers: {
+          ...cors,
+          "Content-Type": "text/plain; charset=utf-8",
+        },
+        body:
+          "Upstream " + upstream.status + " " + (upstream.statusText || "") +
+          "\n" + buf.toString("utf-8").slice(0, 500),
+      };
+    }
+
+    // Detect an HLS playlist by SNIFFING the body, not the file extension.
+    // Some Xtream servers return raw MPEG-TS (or a redirect to it) from a
+    // ".m3u8" URL; treating that as text corrupts it.
+    const head = buf.slice(0, 16).toString("utf-8").replace(/^﻿/, "").trimStart();
+    const isPlaylist =
+      head.startsWith("#EXTM3U") ||
       contentType.includes("mpegurl") ||
       contentType.includes("application/x-mpegURL");
 
-    if (looksLikeM3u8) {
-      const text = await upstream.text();
-      const body = rewriteM3u8(text, upstream.url || target);
+    if (isPlaylist) {
+      const body = rewriteM3u8(buf.toString("utf-8"), upstream.url || target);
       return {
-        statusCode: upstream.status === 0 ? 200 : upstream.status,
+        statusCode: 200,
         headers: {
           ...cors,
           "Content-Type": "application/vnd.apple.mpegurl",
@@ -122,8 +143,6 @@ exports.handler = async (event) => {
       contentType.includes("json") ||
       contentType.includes("text") ||
       contentType.includes("xml");
-
-    const buf = Buffer.from(await upstream.arrayBuffer());
 
     const passHeaders = {
       ...cors,
