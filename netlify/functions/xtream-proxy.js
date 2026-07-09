@@ -85,6 +85,12 @@ exports.handler = async (event) => {
     return { statusCode: 400, headers: cors, body: "Invalid target URL" };
   }
 
+  // Serverless functions must return a COMPLETE response. A finite playlist
+  // or short .ts segment returns quickly; a continuous/live MPEG-TS stream
+  // never finishes, so abort it rather than hang until the platform kills us.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 9000);
+
   try {
     const upstream = await fetch(target, {
       headers: {
@@ -95,10 +101,29 @@ exports.handler = async (event) => {
           : {}),
       },
       redirect: "follow",
+      signal: controller.signal,
     });
 
     const contentType = upstream.headers.get("content-type") || "";
-    const buf = Buffer.from(await upstream.arrayBuffer());
+    let buf;
+    try {
+      buf = Buffer.from(await upstream.arrayBuffer());
+    } catch (readErr) {
+      clearTimeout(timeout);
+      const aborted =
+        (readErr && readErr.name === "AbortError") || controller.signal.aborted;
+      return {
+        statusCode: 504,
+        headers: { ...cors, "Content-Type": "text/plain; charset=utf-8" },
+        body: aborted
+          ? "Upstream did not return a finite response within 9s. This usually " +
+            "means the server sends a continuous MPEG-TS stream rather than a " +
+            "segmented HLS playlist, which a serverless proxy cannot relay."
+          : "Error reading upstream body: " +
+            (readErr && readErr.message ? readErr.message : String(readErr)),
+      };
+    }
+    clearTimeout(timeout);
 
     // If the upstream failed, pass the real status + body straight through
     // (don't disguise an error page as a valid playlist — that just makes
@@ -160,10 +185,16 @@ exports.handler = async (event) => {
       isBase64Encoded: !isText,
     };
   } catch (err) {
+    clearTimeout(timeout);
+    const aborted =
+      (err && err.name === "AbortError") || controller.signal.aborted;
     return {
-      statusCode: 502,
-      headers: cors,
-      body: `Proxy error: ${err && err.message ? err.message : String(err)}`,
+      statusCode: aborted ? 504 : 502,
+      headers: { ...cors, "Content-Type": "text/plain; charset=utf-8" },
+      body: aborted
+        ? "Upstream timed out after 9s (likely a continuous MPEG-TS stream, " +
+          "not a segmented HLS playlist)."
+        : `Proxy error: ${err && err.message ? err.message : String(err)}`,
     };
   }
 };

@@ -619,13 +619,16 @@
       hls.on(window.Hls.Events.ERROR, function (evt, data) {
         console.warn("[hls]", data && data.type, data && data.details, data);
         if (!data || !data.fatal) return;
+        var detail = (data.details || "") +
+          (data.response && data.response.code ? " (HTTP " + data.response.code + ")" : "");
         switch (data.type) {
           case window.Hls.ErrorTypes.NETWORK_ERROR:
             if (netRetries++ < 2) {
-              $("np-status").textContent = "Network issue — retrying (" + netRetries + ")…";
+              $("np-status").textContent = "Network issue [" + detail + "] — retrying (" + netRetries + ")…";
               hls.startLoad();
             } else {
               hls.destroy(); hls = null;
+              $("np-status").textContent = "Failed [" + detail + "] — checking…";
               diagnose(src);
             }
             break;
