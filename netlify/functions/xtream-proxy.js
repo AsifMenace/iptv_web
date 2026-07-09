@@ -1,0 +1,150 @@
+// Netlify Function: Xtream Codes proxy
+//
+// Proxies both:
+//   1. player_api.php API calls (get_live_categories, get_live_streams, ...)
+//   2. /live/.../.m3u8 HLS stream playlists (and their nested playlists + .ts segments)
+//
+// Xtream servers usually block direct browser CORS requests, so the frontend
+// routes everything through here. A single `url` query param carries the fully
+// qualified target URL (encoded). For HLS playlists we rewrite every child URL
+// so segments/keys/variant-playlists come back through this same proxy.
+
+const PROXY_PATH = "/.netlify/functions/xtream-proxy";
+
+// Mimic a media player; some Xtream servers reject unknown user agents.
+const UPSTREAM_HEADERS = {
+  "User-Agent": "VLC/3.0.18 LibVLC/3.0.18",
+  Accept: "*/*",
+};
+
+function proxied(absoluteUrl) {
+  return `${PROXY_PATH}?url=${encodeURIComponent(absoluteUrl)}`;
+}
+
+// Rewrite the URLs inside an m3u8 playlist so every referenced resource
+// (variant playlists, segments, encryption keys) is fetched via this proxy.
+function rewriteM3u8(text, baseUrl) {
+  return text
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (trimmed === "") return line;
+
+      if (trimmed.startsWith("#")) {
+        // Tags may embed a URI="..." (EXT-X-KEY, EXT-X-MEDIA, EXT-X-MAP, ...)
+        return line.replace(/URI="([^"]+)"/g, (_m, uri) => {
+          try {
+            const abs = new URL(uri, baseUrl).href;
+            return `URI="${proxied(abs)}"`;
+          } catch (_e) {
+            return `URI="${uri}"`;
+          }
+        });
+      }
+
+      // Bare resource line (a variant playlist or a segment)
+      try {
+        const abs = new URL(trimmed, baseUrl).href;
+        return proxied(abs);
+      } catch (_e) {
+        return line;
+      }
+    })
+    .join("\n");
+}
+
+exports.handler = async (event) => {
+  const cors = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Range",
+  };
+
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers: cors, body: "" };
+  }
+
+  const raw = event.queryStringParameters && event.queryStringParameters.url;
+  if (!raw) {
+    return {
+      statusCode: 400,
+      headers: cors,
+      body: "Missing 'url' query parameter",
+    };
+  }
+
+  let target;
+  try {
+    target = decodeURIComponent(raw);
+  } catch (_e) {
+    target = raw;
+  }
+
+  // Only allow http(s) targets.
+  if (!/^https?:\/\//i.test(target)) {
+    return { statusCode: 400, headers: cors, body: "Invalid target URL" };
+  }
+
+  try {
+    const upstream = await fetch(target, {
+      headers: {
+        ...UPSTREAM_HEADERS,
+        // Forward Range so seeking / partial segment fetches work.
+        ...(event.headers && event.headers.range
+          ? { Range: event.headers.range }
+          : {}),
+      },
+      redirect: "follow",
+    });
+
+    const contentType = upstream.headers.get("content-type") || "";
+    const looksLikeM3u8 =
+      /\.m3u8(\?|$)/i.test(target) ||
+      contentType.includes("mpegurl") ||
+      contentType.includes("application/x-mpegURL");
+
+    if (looksLikeM3u8) {
+      const text = await upstream.text();
+      const body = rewriteM3u8(text, upstream.url || target);
+      return {
+        statusCode: upstream.status === 0 ? 200 : upstream.status,
+        headers: {
+          ...cors,
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Cache-Control": "no-cache",
+        },
+        body,
+      };
+    }
+
+    // JSON API responses (and any other text) pass through as UTF-8.
+    const isText =
+      contentType.includes("json") ||
+      contentType.includes("text") ||
+      contentType.includes("xml");
+
+    const buf = Buffer.from(await upstream.arrayBuffer());
+
+    const passHeaders = {
+      ...cors,
+      "Content-Type": contentType || "application/octet-stream",
+    };
+    const contentRange = upstream.headers.get("content-range");
+    if (contentRange) passHeaders["Content-Range"] = contentRange;
+    const acceptRanges = upstream.headers.get("accept-ranges");
+    if (acceptRanges) passHeaders["Accept-Ranges"] = acceptRanges;
+
+    return {
+      statusCode: upstream.status,
+      headers: passHeaders,
+      body: isText ? buf.toString("utf-8") : buf.toString("base64"),
+      isBase64Encoded: !isText,
+    };
+  } catch (err) {
+    return {
+      statusCode: 502,
+      headers: cors,
+      body: `Proxy error: ${err && err.message ? err.message : String(err)}`,
+    };
+  }
+};
